@@ -378,7 +378,17 @@ target_include_directories(lvgl_linux PUBLIC
 # Link LVGL with external dependencies - Modern CMake/CMP0079 allows this
 target_link_libraries(lvgl PUBLIC ${PKG_CONFIG_LIB} m pthread)
 
-add_executable(lvglsim src/main.c ${LV_LINUX_SRC} ${LV_LINUX_BACKEND_SRC})
+file(GLOB POWERDOCK_SRC
+    ${CMAKE_SOURCE_DIR}/src/*.c
+    ${CMAKE_SOURCE_DIR}/src/**/*.c
+    ${CMAKE_SOURCE_DIR}/src/*.cpp
+    ${CMAKE_SOURCE_DIR}/src/**/*.cpp
+)
+
+add_executable(lvglsim
+    ${POWERDOCK_SRC}
+    ${LV_LINUX_BACKEND_SRC}
+)
 target_link_libraries(lvglsim lvgl_linux lvgl)
 
 if(WERROR)
@@ -400,3 +410,4 @@ install(TARGETS lvgl_linux
 )
 
 add_custom_target(run COMMAND ${EXECUTABLE_OUTPUT_PATH}/lvglsim DEPENDS lvglsim)
+message(STATUS "PowerDock sources included in lvglsim build")

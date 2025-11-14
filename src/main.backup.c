@@ -37,7 +37,7 @@
 /* OTA Configuration */
 #define GITHUB_REPO_OWNER "DrFailbucket"
 #define GITHUB_REPO_NAME "PowerDock"
-#define CURRENT_VERSION "1.0.4"
+#define CURRENT_VERSION "1.0.3"
 #define GITHUB_API_URL "https://api.github.com/repos/" GITHUB_REPO_OWNER "/" GITHUB_REPO_NAME "/releases/latest"
 
 typedef enum {
@@ -91,7 +91,7 @@ void log_set_level(LogLevel level) {
         time_t now = time(NULL); \
         struct tm *t = localtime(&now); \
         const char *level_str[] = {"DEBUG", "INFO", "WARN", "ERROR"}; \
-        char buffer[1024]; /* Von 256 auf 1024 erhoeht */ \
+        char buffer[1024]; \
         snprintf(buffer, sizeof(buffer), "[%02d:%02d:%02d] [%s] " fmt "\n", \
                  t->tm_hour, t->tm_min, t->tm_sec, level_str[level], ##__VA_ARGS__); \
         \
@@ -125,11 +125,9 @@ void log_set_level(LogLevel level) {
 
 /* ===== Global Variables ===== */
 static char *selected_backend;
-static lv_obj_t *g_temp_label = NULL;
-static lv_timer_t *g_temp_label_timer = NULL;
 extern simulator_settings_t settings;
 static lv_obj_t *wifi_spinner = NULL;
-static char *pending_update_version = NULL; /* Speichert Version fuer Installation */
+static char *pending_update_version = NULL;
 
 /* ===== Function Prototypes ===== */
 static void configure_simulator(int argc, char **argv);
@@ -171,37 +169,33 @@ static void run_update_installation(const char *version);
 
 /* ===== OTA Update Functions ===== */
 
-/* Struktur fuer curl Antwort */
 typedef struct {
     char *data;
     size_t size;
 } curl_response_t;
 
-/* Liest GitHub Token aus Config-Datei */
 static char* load_github_token(void) {
-    DEBUG_LOG("OTA: Loading GitHub token from config file");
+    LOG_DEBUG_ONCE("OTA: Loading GitHub token from config file: %s", OTA_CONFIG_FILE);
     
     FILE *f = fopen(OTA_CONFIG_FILE, "r");
     if (!f) {
-        DEBUG_LOG("OTA: Config file not found: %s", OTA_CONFIG_FILE);
-        DEBUG_LOG("OTA: Continuing without authentication (public repos only)");
+        LOG_INFO("OTA: Config file not found, continuing without authentication");
         return NULL;
     }
     
-    /* Lese Datei */
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
     
     if (fsize <= 0 || fsize > 10000) {
-        DEBUG_LOG("OTA: Invalid config file size: %ld", fsize);
+        LOG_WARN("OTA: Invalid config file size: %ld bytes", fsize);
         fclose(f);
         return NULL;
     }
     
     char *json_str = malloc(fsize + 1);
     if (!json_str) {
-        DEBUG_LOG("OTA: Memory allocation failed");
+        LOG_ERROR("OTA: Memory allocation failed for config");
         fclose(f);
         return NULL;
     }
@@ -210,12 +204,11 @@ static char* load_github_token(void) {
     json_str[fsize] = 0;
     fclose(f);
     
-    /* Parse JSON */
     cJSON *root = cJSON_Parse(json_str);
     free(json_str);
     
     if (!root) {
-        DEBUG_LOG("OTA: Failed to parse config JSON");
+        LOG_WARN("OTA: Failed to parse config JSON");
         return NULL;
     }
     
@@ -224,23 +217,22 @@ static char* load_github_token(void) {
     
     if (cJSON_IsString(token_item) && token_item->valuestring != NULL) {
         token = strdup(token_item->valuestring);
-        DEBUG_LOG("OTA: GitHub token loaded successfully");
+        LOG_INFO("OTA: GitHub token loaded successfully");
     } else {
-        DEBUG_LOG("OTA: No 'github_token' field found in config");
+        LOG_DEBUG("OTA: No github_token field found in config");
     }
     
     cJSON_Delete(root);
     return token;
 }
 
-/* Callback fuer curl um Daten zu empfangen */
 static size_t ota_curl_write_cb(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t realsize = size * nmemb;
     curl_response_t *mem = (curl_response_t *)userp;
     
     char *ptr = realloc(mem->data, mem->size + realsize + 1);
     if(!ptr) {
-        DEBUG_LOG("OTA: realloc failed");
+        LOG_ERROR("OTA: realloc failed in curl callback");
         return 0;
     }
     
@@ -252,14 +244,12 @@ static size_t ota_curl_write_cb(void *contents, size_t size, size_t nmemb, void 
     return realsize;
 }
 
-/* Prueft ob WLAN verbunden ist */
 static int check_wifi_connection(void) {
-    DEBUG_LOG("OTA: Checking WiFi connection...");
+    LOG_DEBUG_ONCE("OTA: Checking WiFi connection...");
     
-    /* Methode 1: Pruefe ob NetworkManager aktiv ist */
     FILE *fp = popen("systemctl is-active NetworkManager.service 2>/dev/null", "r");
     if (!fp) {
-        DEBUG_LOG("OTA: Could not check NetworkManager status");
+        LOG_WARN("OTA: Could not check NetworkManager status");
         return 0;
     }
     
@@ -267,7 +257,7 @@ static int check_wifi_connection(void) {
     int nm_active = 0;
     if (fgets(status, sizeof(status), fp) != NULL) {
         status[strcspn(status, "\n")] = 0;
-        DEBUG_LOG("OTA: NetworkManager status: %s", status);
+        LOG_DEBUG("OTA: NetworkManager status: %s", status);
         if (strcmp(status, "active") == 0) {
             nm_active = 1;
         }
@@ -275,14 +265,13 @@ static int check_wifi_connection(void) {
     pclose(fp);
     
     if (!nm_active) {
-        DEBUG_LOG("OTA: NetworkManager not active");
+        LOG_DEBUG("OTA: NetworkManager not active");
         return 0;
     }
     
-    /* Methode 2: Pruefe Netzwerk-Verbindung generell */
     fp = popen("nmcli -t -f STATE general 2>/dev/null", "r");
     if (!fp) {
-        DEBUG_LOG("OTA: Could not check general network state");
+        LOG_WARN("OTA: Could not check general network state");
         return 0;
     }
     
@@ -290,7 +279,7 @@ static int check_wifi_connection(void) {
     int has_connectivity = 0;
     if (fgets(net_state, sizeof(net_state), fp) != NULL) {
         net_state[strcspn(net_state, "\n")] = 0;
-        DEBUG_LOG("OTA: General network state: %s", net_state);
+        LOG_DEBUG("OTA: General network state: %s", net_state);
         
         if (strstr(net_state, "connected") != NULL) {
             has_connectivity = 1;
@@ -299,27 +288,25 @@ static int check_wifi_connection(void) {
     pclose(fp);
     
     if (!has_connectivity) {
-        DEBUG_LOG("OTA: No network connectivity");
+        LOG_DEBUG("OTA: No network connectivity");
         return 0;
     }
     
-    /* Methode 3: Pruefe ob wlan0 verbunden ist */
     fp = popen("nmcli -t -f GENERAL.STATE device show wlan0 2>/dev/null", "r");
     if (!fp) {
-        DEBUG_LOG("OTA: Could not check wlan0 state");
+        LOG_DEBUG("OTA: Could not check wlan0 state, trying route check");
         
-        /* Fallback: Pruefe ob es eine Default-Route gibt */
         fp = popen("ip route | grep default 2>/dev/null", "r");
         if (!fp) {
-            DEBUG_LOG("OTA: Could not check default route");
+            LOG_WARN("OTA: Could not check default route");
             return 0;
         }
         
         char route[256];
         if (fgets(route, sizeof(route), fp) != NULL) {
-            DEBUG_LOG("OTA: Default route exists: %s", route);
+            LOG_DEBUG("OTA: Default route exists");
             pclose(fp);
-            DEBUG_LOG("OTA: WiFi connection status: connected (via route check)");
+            LOG_INFO("OTA: WiFi connected (via route check)");
             return 1;
         }
         pclose(fp);
@@ -330,7 +317,7 @@ static int check_wifi_connection(void) {
     int wlan_connected = 0;
     if (fgets(device_state, sizeof(device_state), fp) != NULL) {
         device_state[strcspn(device_state, "\n")] = 0;
-        DEBUG_LOG("OTA: wlan0 device state: %s", device_state);
+        LOG_DEBUG("OTA: wlan0 device state: %s", device_state);
         
         if (strstr(device_state, "connected") != NULL || 
             strstr(device_state, "100") != NULL) {
@@ -339,11 +326,15 @@ static int check_wifi_connection(void) {
     }
     pclose(fp);
     
-    DEBUG_LOG("OTA: WiFi connection status: %s", wlan_connected ? "connected" : "not connected");
+    if (wlan_connected) {
+        LOG_INFO("OTA: WiFi connected");
+    } else {
+        LOG_DEBUG("OTA: WiFi not connected");
+    }
+    
     return wlan_connected;
 }
 
-/* Vergleicht zwei Versionsnummern (vereinfacht) */
 static int is_newer_version(const char *current, const char *latest) {
     int cur_major = 0, cur_minor = 0, cur_patch = 0;
     int lat_major = 0, lat_minor = 0, lat_patch = 0;
@@ -358,13 +349,11 @@ static int is_newer_version(const char *current, const char *latest) {
     return 0;
 }
 
-/* Prueft auf GitHub nach neuen Releases */
 static void check_for_updates(void) {
-    DEBUG_LOG("OTA: Checking for updates on GitHub...");
-    DEBUG_LOG("OTA: Repository: %s/%s", GITHUB_REPO_OWNER, GITHUB_REPO_NAME);
-    DEBUG_LOG("OTA: API URL: %s", GITHUB_API_URL);
+    LOG_INFO("OTA: Checking for updates on GitHub...");
+    LOG_DEBUG("OTA: Repository: %s/%s", GITHUB_REPO_OWNER, GITHUB_REPO_NAME);
+    LOG_DEBUG("OTA: API URL: %s", GITHUB_API_URL);
     
-    /* Lade GitHub Token aus Config */
     char *github_token = load_github_token();
     
     CURL *curl;
@@ -373,25 +362,23 @@ static void check_for_updates(void) {
     
     curl = curl_easy_init();
     if(!curl) {
-        DEBUG_LOG("OTA: curl_easy_init failed");
+        LOG_ERROR("OTA: curl_easy_init failed");
         show_temp_label("OTA: curl init failed", lv_color_hex(0xFF0000));
-		if (github_token) free(github_token);
+        if (github_token) free(github_token);
         return;
     }
     
-    /* GitHub API Header */
     struct curl_slist *headers = NULL;
     headers = curl_slist_append(headers, "User-Agent: PowerDock-OTA");
     headers = curl_slist_append(headers, "Accept: application/vnd.github.v3+json");
     
-    /* Authorization Header mit Token (fuer private Repos) */
     char auth_header[512];
     if (github_token) {
         snprintf(auth_header, sizeof(auth_header), "Authorization: token %s", github_token);
         headers = curl_slist_append(headers, auth_header);
-        DEBUG_LOG("OTA: Using authentication token");
+        LOG_DEBUG("OTA: Using authentication token");
     } else {
-        DEBUG_LOG("OTA: No token - accessing as public repo");
+        LOG_DEBUG("OTA: No token - accessing as public repo");
     }
     
     curl_easy_setopt(curl, CURLOPT_URL, GITHUB_API_URL);
@@ -406,13 +393,12 @@ static void check_for_updates(void) {
     
     res = curl_easy_perform(curl);
     
-    /* Cleanup Token */
     if (github_token) {
         free(github_token);
     }
     
     if(res != CURLE_OK) {
-        DEBUG_LOG("OTA: curl_easy_perform failed: %s", curl_easy_strerror(res));
+        LOG_ERROR("OTA: curl_easy_perform failed: %s", curl_easy_strerror(res));
         show_temp_label("OTA: Connection failed", lv_color_hex(0xFF0000));
         curl_easy_cleanup(curl);
         curl_slist_free_all(headers);
@@ -422,50 +408,49 @@ static void check_for_updates(void) {
     
     long http_code = 0;
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-    DEBUG_LOG("OTA: HTTP response code: %ld", http_code);
+    LOG_DEBUG("OTA: HTTP response code: %ld", http_code);
     
     if (response.data && response.size > 0) {
-        DEBUG_LOG("OTA: Response size: %zu bytes", response.size);
-        DEBUG_LOG("OTA: Response preview (first 200 chars): %.200s", response.data);
+        LOG_DEBUG("OTA: Response size: %zu bytes", response.size);
+        LOG_DEBUG_ONCE("OTA: Response preview: %.200s", response.data);
     } else {
-        DEBUG_LOG("OTA: No response data received");
+        LOG_WARN("OTA: No response data received");
     }
     
     curl_easy_cleanup(curl);
     curl_slist_free_all(headers);
     
     if(http_code == 401) {
-        DEBUG_LOG("OTA: Authentication failed - check your GitHub token");
+        LOG_ERROR("OTA: Authentication failed - check your GitHub token");
         show_temp_label("OTA: Auth failed", lv_color_hex(0xFF0000));
         if(response.data) free(response.data);
         return;
     }
     
     if(http_code == 404) {
-        DEBUG_LOG("OTA: GitHub API returned HTTP 404");
-        DEBUG_LOG("OTA: Possible causes:");
-        DEBUG_LOG("OTA:   1. Repository is private and no token provided");
-        DEBUG_LOG("OTA:   2. Repository name is incorrect");
-        DEBUG_LOG("OTA:   3. No releases exist");
-        DEBUG_LOG("OTA:   4. Release is saved as draft or pre-release");
+        LOG_WARN("OTA: GitHub API returned HTTP 404");
+        LOG_DEBUG("OTA: Possible causes:");
+        LOG_DEBUG("OTA:   1. Repository is private and no token provided");
+        LOG_DEBUG("OTA:   2. Repository name is incorrect");
+        LOG_DEBUG("OTA:   3. No releases exist");
+        LOG_DEBUG("OTA:   4. Release is saved as draft or pre-release");
         show_temp_label("OTA: No releases found", lv_color_hex(0xFF0000));
         if(response.data) free(response.data);
         return;
     }
     
     if(http_code != 200) {
-        DEBUG_LOG("OTA: GitHub API returned HTTP %ld", http_code);
+        LOG_ERROR("OTA: GitHub API returned HTTP %ld", http_code);
         show_temp_label("OTA: API error", lv_color_hex(0xFF0000));
         if(response.data) free(response.data);
         return;
     }
     
-    /* Parse JSON Response */
     cJSON *root = cJSON_Parse(response.data);
     free(response.data);
     
     if (!root) {
-        DEBUG_LOG("OTA: JSON parse failed");
+        LOG_ERROR("OTA: JSON parse failed");
         show_temp_label("OTA: Parse error", lv_color_hex(0xFF0000));
         return;
     }
@@ -475,95 +460,80 @@ static void check_for_updates(void) {
     if (cJSON_IsString(tag_name)) {
         const char *latest_version = tag_name->valuestring;
         
-        /* Entferne "v" prefix falls vorhanden */
         if (latest_version[0] == 'v') {
             latest_version++;
         }
         
-        DEBUG_LOG("OTA: Current version: %s", CURRENT_VERSION);
-        DEBUG_LOG("OTA: Latest version: %s", latest_version);
+        LOG_INFO("OTA: Current version: %s", CURRENT_VERSION);
+        LOG_INFO("OTA: Latest version: %s", latest_version);
         
         if (is_newer_version(CURRENT_VERSION, latest_version)) {
-            DEBUG_LOG("OTA: Update available!");
-            
-            /* Zeige Install-Popup */
+            LOG_INFO("OTA: Update available!");
             show_update_install_popup(latest_version);
-            
         } else {
-            DEBUG_LOG("OTA: Software is up to date");
+            LOG_INFO("OTA: Software is up to date");
             show_temp_label("Software is up to date", lv_color_hex(0x0080FF));
         }
     } else {
-        DEBUG_LOG("OTA: tag_name not found in response");
+        LOG_ERROR("OTA: tag_name not found in response");
         show_temp_label("OTA: Invalid response", lv_color_hex(0xFF0000));
     }
     
     cJSON_Delete(root);
 }
 
-/* Aktualisiert Sichtbarkeit des Check Updates Buttons */
 static void update_check_button_visibility(void) {
     if (!ui_btnCheckUpdates || !lv_obj_is_valid(ui_btnCheckUpdates)) {
-        DEBUG_LOG("OTA: btnCheckUpdates not found");
+        LOG_DEBUG_ONCE("OTA: btnCheckUpdates not found");
         return;
     }
     
     if (!ui_ddOTA || !lv_obj_is_valid(ui_ddOTA)) {
-        DEBUG_LOG("OTA: ddOTA not found");
+        LOG_DEBUG_ONCE("OTA: ddOTA not found");
         return;
     }
     
     uint16_t selected = lv_dropdown_get_selected(ui_ddOTA);
     
-    /* Index 1 = "Enabled" */
     if (selected == 1) {
-        DEBUG_LOG("OTA: Showing Check Updates button");
+        LOG_DEBUG("OTA: Showing Check Updates button");
         lv_obj_clear_flag(ui_btnCheckUpdates, LV_OBJ_FLAG_HIDDEN);
     } else {
-        DEBUG_LOG("OTA: Hiding Check Updates button");
+        LOG_DEBUG("OTA: Hiding Check Updates button");
         lv_obj_add_flag(ui_btnCheckUpdates, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
-/* Event Handler fuer OTA Dropdown Aenderung */
 static void ui_event_ddOTA_cb(lv_event_t *e) {
     if(lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
     
-    DEBUG_LOG("OTA: Dropdown value changed");
+    LOG_DEBUG("OTA: Dropdown value changed");
     update_check_button_visibility();
 }
 
-/* Event Handler fuer Check Updates Button */
 static void ui_event_btnCheckUpdates_cb(lv_event_t *e) {
-    DEBUG_LOG("ui_event_btnCheckUpdates_cb: event=%d", lv_event_get_code(e));
-    
     if(lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     
-    DEBUG_LOG("OTA: Check Updates button clicked");
+    LOG_INFO("OTA: Check Updates button clicked");
     
-    /* Pruefe WLAN Verbindung */
     if (!check_wifi_connection()) {
-        DEBUG_LOG("OTA: No WiFi connection");
+        LOG_WARN("OTA: No WiFi connection");
         show_temp_label("No WiFi connection", lv_color_hex(0xFF0000));
         return;
     }
     
-    /* Pruefe auf Updates */
     show_temp_label("Checking for updates...", lv_color_hex(0x0080FF));
     check_for_updates();
 }
 
-/* Zeigt Popup fuer Update-Installation */
 static void show_update_install_popup(const char *version) {
-    DEBUG_LOG("OTA: Showing install popup for version %s", version);
+    LOG_INFO("OTA: Showing install popup for version %s", version);
     
-    /* Speichere Version fuer spaetere Installation */
     if (pending_update_version) {
         free(pending_update_version);
     }
     pending_update_version = strdup(version);
     
-    /* Erstelle Popup Container */
     lv_obj_t *popup = lv_obj_create(lv_scr_act());
     lv_obj_set_size(popup, 400, 200);
     lv_obj_center(popup);
@@ -575,7 +545,6 @@ static void show_update_install_popup(const char *version) {
     lv_obj_set_style_shadow_width(popup, 20, 0);
     lv_obj_set_style_shadow_spread(popup, 2, 0);
     
-    /* Frage Label */
     lv_obj_t *label_question = lv_label_create(popup);
     char msg[128];
     snprintf(msg, sizeof(msg), "Install update v%s?", version);
@@ -583,14 +552,12 @@ static void show_update_install_popup(const char *version) {
     lv_obj_set_style_text_font(label_question, &lv_font_montserrat_24, 0);
     lv_obj_align(label_question, LV_ALIGN_TOP_MID, 0, 20);
     
-    /* Info Label */
     lv_obj_t *label_info = lv_label_create(popup);
     lv_label_set_text(label_info, "This will download and install\nthe update automatically.");
     lv_obj_set_style_text_font(label_info, &lv_font_montserrat_14, 0);
     lv_obj_align(label_info, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_text_align(label_info, LV_TEXT_ALIGN_CENTER, 0);
     
-    /* Install Button */
     lv_obj_t *btn_install = lv_button_create(popup);
     lv_obj_set_size(btn_install, 120, 50);
     lv_obj_align(btn_install, LV_ALIGN_BOTTOM_LEFT, 30, -20);
@@ -602,7 +569,6 @@ static void show_update_install_popup(const char *version) {
     lv_obj_set_style_text_font(label_install, &lv_font_montserrat_18, 0);
     lv_obj_center(label_install);
     
-    /* Cancel Button */
     lv_obj_t *btn_cancel = lv_button_create(popup);
     lv_obj_set_size(btn_cancel, 120, 50);
     lv_obj_align(btn_cancel, LV_ALIGN_BOTTOM_RIGHT, -30, -20);
@@ -614,48 +580,37 @@ static void show_update_install_popup(const char *version) {
     lv_obj_set_style_text_font(label_cancel, &lv_font_montserrat_18, 0);
     lv_obj_center(label_cancel);
     
-    DEBUG_LOG("OTA: Install popup created");
+    LOG_DEBUG("OTA: Install popup created");
 }
 
-/* Event Handler fuer Install Button */
 static void install_update_cb(lv_event_t *e) {
-    DEBUG_LOG("OTA: Install button clicked");
+    LOG_INFO("OTA: Install button clicked");
     
     lv_obj_t *popup = (lv_obj_t *)lv_event_get_user_data(e);
     
     if (pending_update_version) {
-        DEBUG_LOG("OTA: Starting installation of version %s", pending_update_version);
-        
-        /* Zeige "Installing..." Label */
+        LOG_INFO("OTA: Starting installation of version %s", pending_update_version);
         show_temp_label("Installing update...", lv_color_hex(0xFFFF00));
-        
-        /* Starte Installation */
         run_update_installation(pending_update_version);
-        
-        /* Cleanup */
         free(pending_update_version);
         pending_update_version = NULL;
     }
     
-    /* Schliesse Popup */
     if (popup && lv_obj_is_valid(popup)) {
         lv_obj_del(popup);
     }
 }
 
-/* Event Handler fuer Cancel Button */
 static void cancel_update_cb(lv_event_t *e) {
-    DEBUG_LOG("OTA: Cancel button clicked");
+    LOG_INFO("OTA: Cancel button clicked");
     
     lv_obj_t *popup = (lv_obj_t *)lv_event_get_user_data(e);
     
-    /* Cleanup */
     if (pending_update_version) {
         free(pending_update_version);
         pending_update_version = NULL;
     }
     
-    /* Schliesse Popup */
     if (popup && lv_obj_is_valid(popup)) {
         lv_obj_del(popup);
     }
@@ -663,25 +618,23 @@ static void cancel_update_cb(lv_event_t *e) {
     show_temp_label("Update cancelled", lv_color_hex(0xFF0000));
 }
 
-/* Fuehrt Update-Installation aus */
 static void run_update_installation(const char *version) {
-    DEBUG_LOG("OTA: Running update installation for version %s", version);
+    LOG_INFO("OTA: Running update installation for version %s", version);
     
-    /* Erstelle Befehl fuer Python Script */
     char cmd[512];
     snprintf(cmd, sizeof(cmd), 
              "python3 /home/breuil/ota_install.py %s %s %s &", 
              GITHUB_REPO_OWNER, GITHUB_REPO_NAME, version);
     
-    DEBUG_LOG("OTA: Executing: %s", cmd);
+    LOG_DEBUG("OTA: Executing: %s", cmd);
     
     int ret = system(cmd);
     
     if (ret == 0) {
-        DEBUG_LOG("OTA: Update installation started successfully");
+        LOG_INFO("OTA: Update installation started successfully");
         show_temp_label("Update started - check logs", lv_color_hex(0x00FF00));
     } else {
-        DEBUG_LOG("OTA: Failed to start update installation");
+        LOG_ERROR("OTA: Failed to start update installation (code: %d)", ret);
         show_temp_label("Update failed to start", lv_color_hex(0xFF0000));
     }
 }
@@ -689,17 +642,15 @@ static void run_update_installation(const char *version) {
 /* ===== System Control Callbacks ===== */
 
 static void btn_shutdown_cb(lv_event_t *e) {
-    DEBUG_LOG("btn_shutdown_cb: event=%d", lv_event_get_code(e));
     if(lv_event_get_code(e) == LV_EVENT_CLICKED) {
-        DEBUG_LOG("Shutdown button pressed - executing shutdown");
+        LOG_WARN("Shutdown button pressed - executing shutdown");
         system("sudo shutdown -h now");
     }
 }
 
 static void btn_reboot_cb(lv_event_t *e) {
-    DEBUG_LOG("btn_reboot_cb: event=%d", lv_event_get_code(e));
     if(lv_event_get_code(e) == LV_EVENT_CLICKED) {
-        DEBUG_LOG("Reboot button pressed - executing reboot");
+        LOG_WARN("Reboot button pressed - executing reboot");
         system("sudo reboot");
     }
 }
@@ -707,36 +658,34 @@ static void btn_reboot_cb(lv_event_t *e) {
 /* ===== WiFi Status Helpers ===== */
 
 static void sync_wlan_toggle_with_service_status(void) {
+    LOG_DEBUG_ONCE("sync_wlan_toggle_with_service_status: Syncing toggle state");
+    
     if (ui_Label35 && !lv_obj_check_type(ui_Label35, &lv_label_class)) {
-        DEBUG_LOG("WARN: ui_Label35 is not a label!");
+        LOG_WARN("ui_Label35 is not a label!");
         return;
     }
-
-    DEBUG_LOG("sync_wlan_toggle_with_service_status: START");
     
     FILE *fp = popen("systemctl is-active NetworkManager.service", "r");
     if (!fp) {
-        DEBUG_LOG("ERROR: Could not check NetworkManager status");
+        LOG_ERROR("Could not check NetworkManager status");
         return;
     }
     
     char status[32];
     if (fgets(status, sizeof(status), fp) != NULL) {
         status[strcspn(status, "\n")] = 0;
-        DEBUG_LOG("NetworkManager status: %s", status);
+        LOG_DEBUG("NetworkManager status: %s", status);
         
         if (strcmp(status, "active") == 0) {
-            DEBUG_LOG("Setting WLAN toggle to ON");
             if (ui_SwitchWLANOnOff && lv_obj_is_valid(ui_SwitchWLANOnOff)) {
                 lv_obj_add_state(ui_SwitchWLANOnOff, LV_STATE_CHECKED);
             } else {
-                DEBUG_LOG("ERROR: ui_SwitchWLANOnOff is NULL or invalid!");
+                LOG_ERROR("ui_SwitchWLANOnOff is NULL or invalid!");
             }
             if (ui_Label35 && lv_obj_is_valid(ui_Label35)) {
                 lv_label_set_text(ui_Label35, "WLAN aktiv");
             }
         } else {
-            DEBUG_LOG("Setting WLAN toggle to OFF");
             if (ui_SwitchWLANOnOff && lv_obj_is_valid(ui_SwitchWLANOnOff)) {
                 lv_obj_clear_state(ui_SwitchWLANOnOff, LV_STATE_CHECKED);
             }
@@ -747,42 +696,26 @@ static void sync_wlan_toggle_with_service_status(void) {
     }
     
     pclose(fp);
-    DEBUG_LOG("sync_wlan_toggle_with_service_status: END");
 }
 
 static void temp_label_timer_cb(lv_timer_t *timer) {
-    DEBUG_LOG("temp_label_timer_cb: called");
     lv_obj_t *lbl = (lv_obj_t *)lv_timer_get_user_data(timer);
     if (lbl && lv_obj_is_valid(lbl)) {
-        DEBUG_LOG("Deleting temp label");
         lv_obj_del(lbl);
     }
-    g_temp_label = NULL;
-    g_temp_label_timer = NULL;
-    lv_timer_del(timer);
 }
 
 static void wlan_status_timer(lv_timer_t *t) {
-    DEBUG_LOG("wlan_status_timer: tick");
     LV_UNUSED(t);
     sync_wlan_toggle_with_service_status();
 }
 
 static void show_temp_label(const char *text, lv_color_t color) {
-    DEBUG_LOG("show_temp_label: %s", text);
-
-    if (g_temp_label_timer) {
-        lv_timer_del(g_temp_label_timer);
-        g_temp_label_timer = NULL;
-    }
-    if (g_temp_label && lv_obj_is_valid(g_temp_label)) {
-        lv_obj_del(g_temp_label);
-        g_temp_label = NULL;
-    }
-
+    LOG_DEBUG_ONCE("show_temp_label: Creating temporary label");
+    
     lv_obj_t *label = lv_label_create(lv_scr_act());
     if (!label) {
-        DEBUG_LOG("ERROR: Could not create temp label!");
+        LOG_ERROR("Could not create temp label!");
         return;
     }
     
@@ -794,18 +727,19 @@ static void show_temp_label(const char *text, lv_color_t color) {
     lv_obj_set_style_radius(label, 6, 0);
     lv_obj_align(label, LV_ALIGN_BOTTOM_MID, 0, -10);
 
-    g_temp_label = label;
-    g_temp_label_timer = lv_timer_create(temp_label_timer_cb, 10000, label);
-    
-    DEBUG_LOG("show_temp_label: created successfully");
+    lv_timer_t *t = lv_timer_create_basic();
+    lv_timer_set_period(t, 10000);
+    lv_timer_set_repeat_count(t, 1);
+    lv_timer_set_user_data(t, label);
+    lv_timer_set_cb(t, temp_label_timer_cb);
 }
 
 static void wifi_status_popup(void) {
-    DEBUG_LOG("wifi_status_popup: START");
+    LOG_DEBUG_ONCE("wifi_status_popup: Checking WiFi status");
     
     FILE *fp = popen("nmcli -t -f ACTIVE,SSID,SIGNAL dev wifi", "r");
     if (!fp) {
-        DEBUG_LOG("ERROR: Could not run nmcli");
+        LOG_ERROR("Could not run nmcli");
         show_temp_label("WiFi check failed", lv_color_hex(0xFF0000));
         return;
     }
@@ -813,7 +747,6 @@ static void wifi_status_popup(void) {
     char line[256];
     int found = 0;
     while (fgets(line, sizeof(line), fp)) {
-        DEBUG_LOG("nmcli output: %s", line);
         if (strncmp(line, "yes:", 4) == 0) {
             found = 1;
             char *p = line + 4;
@@ -824,7 +757,7 @@ static void wifi_status_popup(void) {
             
             char msg[256];
             snprintf(msg, sizeof(msg), "Connected: %s (%s%%)", ssid, signal);
-            DEBUG_LOG("WiFi connected: %s", msg);
+            LOG_INFO("WiFi connected: %s (%s%%)", ssid, signal);
             show_temp_label(msg, lv_color_hex(0x00FF00));
             break;
         }
@@ -832,28 +765,25 @@ static void wifi_status_popup(void) {
     pclose(fp);
     
     if (!found) {
-        DEBUG_LOG("No active WiFi connection found");
+        LOG_INFO("No active WiFi connection found");
         show_temp_label("No WiFi connection", lv_color_hex(0xFF0000));
     }
-    
-    DEBUG_LOG("wifi_status_popup: END");
 }
-
 /* ===== WiFi List Management ===== */
 
 static void update_wifi_list(void) {
-    DEBUG_LOG("update_wifi_list: START");
+    LOG_DEBUG_ONCE("update_wifi_list: Updating WiFi dropdown");
     
     FILE *f = fopen(WIFI_DATA_FILE, "r");
     if (!f) {
-        DEBUG_LOG("ERROR: Could not open %s", WIFI_DATA_FILE);
+        LOG_ERROR("Could not open %s", WIFI_DATA_FILE);
         return;
     }
 
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
-    DEBUG_LOG("WiFi data file size: %ld bytes", fsize);
+    LOG_DEBUG_ONCE("WiFi data file size: %ld bytes", fsize);
 
     char *json_str = malloc(fsize + 1);
     fread(json_str, 1, fsize, f);
@@ -864,7 +794,7 @@ static void update_wifi_list(void) {
     free(json_str);
 
     if (!root) {
-        DEBUG_LOG("ERROR: Could not parse JSON");
+        LOG_ERROR("Could not parse WiFi JSON");
         return;
     }
 
@@ -872,13 +802,13 @@ static void update_wifi_list(void) {
     if (cJSON_IsArray(ssids)) {
         char options[2048] = "";
         int count = cJSON_GetArraySize(ssids);
-        DEBUG_LOG("Found %d SSIDs", count);
+        LOG_INFO("Found %d WiFi networks", count);
 
         for (int i = 0; i < count; i++) {
             cJSON *ssid = cJSON_GetArrayItem(ssids, i);
             if (cJSON_IsString(ssid)) {
                 const char *ssid_str = cJSON_GetStringValue(ssid);
-                DEBUG_LOG("SSID[%d]: %s", i, ssid_str);
+                LOG_DEBUG_ONCE("SSID[%d]: %s", i, ssid_str);
                 strcat(options, ssid_str);
                 if (i < count - 1) strcat(options, "\n");
             }
@@ -887,22 +817,21 @@ static void update_wifi_list(void) {
         if (ui_ssidList && lv_obj_is_valid(ui_ssidList)) {
             lv_dropdown_clear_options(ui_ssidList);
             lv_dropdown_set_options(ui_ssidList, options);
-            DEBUG_LOG("Dropdown updated successfully");
+            LOG_DEBUG("Dropdown updated successfully");
         } else {
-            DEBUG_LOG("ERROR: ui_ssidList is NULL or invalid!");
+            LOG_ERROR("ui_ssidList is NULL or invalid!");
         }
     }
 
     cJSON_Delete(root);
-    DEBUG_LOG("update_wifi_list: END");
 }
 
 static void load_saved_ssids_from_file(void) {
-    DEBUG_LOG("load_saved_ssids_from_file: START");
+    LOG_DEBUG_ONCE("load_saved_ssids_from_file: Loading saved WiFi connections");
     
     FILE *f = fopen(SAVED_WIFI_FILE, "r");
     if(!f) {
-        DEBUG_LOG("No saved WiFi file found");
+        LOG_INFO("No saved WiFi file found");
         if (ui_savedSSIDs && lv_obj_is_valid(ui_savedSSIDs)) {
             lv_dropdown_set_options(ui_savedSSIDs, "Keine gespeicherten Netzwerke");
         }
@@ -912,7 +841,7 @@ static void load_saved_ssids_from_file(void) {
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
-    DEBUG_LOG("Saved WiFi file size: %ld bytes", fsize);
+    LOG_DEBUG_ONCE("Saved WiFi file size: %ld bytes", fsize);
     
     char *json_str = malloc(fsize + 1);
     fread(json_str, 1, fsize, f);
@@ -927,7 +856,7 @@ static void load_saved_ssids_from_file(void) {
         if(cJSON_IsArray(saved)) {
             char options[2048] = "";
             int count = cJSON_GetArraySize(saved);
-            DEBUG_LOG("Loaded %d saved connections", count);
+            LOG_INFO("Loaded %d saved connections", count);
             
             if(count == 0) {
                 strcpy(options, "Keine gespeicherten Netzwerke");
@@ -938,7 +867,7 @@ static void load_saved_ssids_from_file(void) {
                         cJSON *display = cJSON_GetObjectItem(item, "display_name");
                         if(cJSON_IsString(display)) {
                             const char *name = cJSON_GetStringValue(display);
-                            DEBUG_LOG("Saved connection[%d]: %s", i, name);
+                            LOG_DEBUG_ONCE("Saved connection[%d]: %s", i, name);
                             strcat(options, name);
                             if(i < count - 1) strcat(options, "\n");
                         }
@@ -948,34 +877,28 @@ static void load_saved_ssids_from_file(void) {
             
             if (ui_savedSSIDs && lv_obj_is_valid(ui_savedSSIDs)) {
                 lv_dropdown_set_options(ui_savedSSIDs, options);
-                DEBUG_LOG("Saved SSIDs dropdown updated");
+                LOG_DEBUG("Saved SSIDs dropdown updated");
             } else {
-                DEBUG_LOG("ERROR: ui_savedSSIDs is NULL or invalid!");
+                LOG_ERROR("ui_savedSSIDs is NULL or invalid!");
             }
         }
         cJSON_Delete(root);
     }
-    
-    DEBUG_LOG("load_saved_ssids_from_file: END");
 }
 
 static void update_saved_ssids(void) {
-    DEBUG_LOG("update_saved_ssids: START - running Python script");
+    LOG_DEBUG_ONCE("update_saved_ssids: Running Python script");
     system("python3 /home/breuil/saved_wifi.py");
-    DEBUG_LOG("Python script completed");
     load_saved_ssids_from_file();
-    DEBUG_LOG("update_saved_ssids: END");
 }
 
 static void delayed_load_saved_ssids_timer(lv_timer_t *t) {
-    DEBUG_LOG("delayed_load_saved_ssids_timer: called");
     (void)t;
     update_saved_ssids();
     lv_timer_del(t);
 }
 
 static void delayed_update_saved_ssids(lv_timer_t *t) {
-    DEBUG_LOG("delayed_update_saved_ssids: called");
     (void)t;
     update_saved_ssids();
     lv_timer_del(t);
@@ -984,10 +907,9 @@ static void delayed_update_saved_ssids(lv_timer_t *t) {
 /* ===== WiFi Event Callbacks ===== */
 
 static void wifi_spinner_timer_cb(lv_timer_t *timer) {
-    DEBUG_LOG("wifi_spinner_timer_cb: called");
     LV_UNUSED(timer);
     if (wifi_spinner && lv_obj_is_valid(wifi_spinner)) {
-        DEBUG_LOG("Deleting WiFi spinner");
+        LOG_DEBUG("Deleting WiFi spinner");
         lv_obj_del(wifi_spinner);
         wifi_spinner = NULL;
     }
@@ -995,19 +917,18 @@ static void wifi_spinner_timer_cb(lv_timer_t *timer) {
 }
 
 static void ui_event_btnsearch(lv_event_t *e) {
-    DEBUG_LOG("ui_event_btnsearch: event=%d", lv_event_get_code(e));
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
 
-    DEBUG_LOG("WiFi Search started");
+    LOG_INFO("WiFi Search started");
 
     if (wifi_spinner) {
-        DEBUG_LOG("Spinner already active, ignoring click");
+        LOG_DEBUG("Spinner already active, ignoring click");
         return;
     }
 
     wifi_spinner = lv_spinner_create(lv_scr_act());
     if (!wifi_spinner) {
-        DEBUG_LOG("ERROR: Could not create spinner!");
+        LOG_ERROR("Could not create spinner!");
         return;
     }
     
@@ -1017,7 +938,7 @@ static void ui_event_btnsearch(lv_event_t *e) {
 
     show_temp_label("WiFi search started", lv_color_hex(0x00FF00));
 
-    DEBUG_LOG("Starting Python WiFi scan script");
+    LOG_DEBUG("Starting Python WiFi scan script");
     system("python3 /home/breuil/wifi_scan.py &");
 
     lv_timer_t *t = lv_timer_create_basic();
@@ -1025,33 +946,28 @@ static void ui_event_btnsearch(lv_event_t *e) {
     lv_timer_set_repeat_count(t, 1);
     lv_timer_set_user_data(t, NULL);
     lv_timer_set_cb(t, wifi_spinner_timer_cb);
-    
-    DEBUG_LOG("WiFi scan timer created");
 }
 
 static void ui_event_btnConnect(lv_event_t *e) {
-    DEBUG_LOG("ui_event_btnConnect: event=%d", lv_event_get_code(e));
     if(lv_event_get_code(e) != LV_EVENT_CLICKED) return;
 
     char ssid[128];
     
     if (!ui_ssidList || !lv_obj_is_valid(ui_ssidList)) {
-        DEBUG_LOG("ERROR: ui_ssidList is NULL or invalid!");
+        LOG_ERROR("ui_ssidList is NULL or invalid!");
         return;
     }
     
     lv_dropdown_get_selected_str(ui_ssidList, ssid, sizeof(ssid));
     
     if (!ui_InputPassKey || !lv_obj_is_valid(ui_InputPassKey)) {
-        DEBUG_LOG("ERROR: ui_InputPassKey is NULL or invalid!");
+        LOG_ERROR("ui_InputPassKey is NULL or invalid!");
         return;
     }
     
     const char *pass = lv_textarea_get_text(ui_InputPassKey);
 
-    DEBUG_LOG("=== WiFi Connect ===");
-    DEBUG_LOG("SSID: '%s'", ssid);
-    DEBUG_LOG("Password length: %zu", strlen(pass));
+    LOG_INFO("WiFi Connect: SSID='%s', password length=%zu", ssid, strlen(pass));
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
@@ -1063,27 +979,27 @@ static void ui_event_btnConnect(lv_event_t *e) {
     }
     lv_refr_now(NULL);
     
-    DEBUG_LOG("Executing: nmcli connect command");
+    LOG_DEBUG("Executing nmcli connect command");
     int ret = system(cmd);
-    DEBUG_LOG("nmcli returned: %d", ret);
+    LOG_DEBUG("nmcli returned: %d", ret);
     
     lv_obj_invalidate(lv_scr_act());
     lv_refr_now(NULL);
     
     if (ret == 0) {
-        DEBUG_LOG("WiFi connected successfully");
+        LOG_INFO("WiFi connected successfully");
         if (ui_Label35 && lv_obj_is_valid(ui_Label35)) {
             lv_label_set_text(ui_Label35, "Verbunden!");
         }
         show_temp_label("WiFi connected", lv_color_hex(0x00FF00));
         wifi_status_popup();
         
-        DEBUG_LOG("Waiting 2 seconds before updating saved SSIDs");
+        LOG_DEBUG("Waiting 2 seconds before updating saved SSIDs");
         usleep(2000000);
         update_saved_ssids();
         
     } else {
-        DEBUG_LOG("WiFi connection failed (code %d)", ret);
+        LOG_ERROR("WiFi connection failed (code %d)", ret);
         if (ui_Label35 && lv_obj_is_valid(ui_Label35)) {
             lv_label_set_text(ui_Label35, "Verbindung fehlgeschlagen");
         }
@@ -1092,22 +1008,21 @@ static void ui_event_btnConnect(lv_event_t *e) {
 }
 
 static void ui_event_savedSSIDs_changed(lv_event_t *e) {
-    DEBUG_LOG("ui_event_savedSSIDs_changed: event=%d", lv_event_get_code(e));
     if(lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
 
     lv_obj_t *dropdown = lv_event_get_target(e);
     char display_name[128];
     lv_dropdown_get_selected_str(dropdown, display_name, sizeof(display_name));
-    DEBUG_LOG("Selected saved SSID: %s", display_name);
+    LOG_DEBUG("Selected saved SSID: %s", display_name);
 
     if (strstr(display_name, "Keine gespeicherten") != NULL) {
-        DEBUG_LOG("No saved networks option selected, ignoring");
+        LOG_DEBUG("No saved networks option selected, ignoring");
         return;
     }
 
     FILE *f = fopen(SAVED_WIFI_FILE, "r");
     if(!f) {
-        DEBUG_LOG("ERROR: Could not open saved WiFi file");
+        LOG_ERROR("Could not open saved WiFi file");
         return;
     }
     
@@ -1126,7 +1041,7 @@ static void ui_event_savedSSIDs_changed(lv_event_t *e) {
     if(root) {
         cJSON *saved = cJSON_GetObjectItem(root, "saved_connections");
         uint16_t idx = lv_dropdown_get_selected(dropdown);
-        DEBUG_LOG("Dropdown index: %u", idx);
+        LOG_DEBUG("Dropdown index: %u", idx);
         
         if(cJSON_IsArray(saved) && idx < cJSON_GetArraySize(saved)) {
             cJSON *item = cJSON_GetArrayItem(saved, idx);
@@ -1134,7 +1049,7 @@ static void ui_event_savedSSIDs_changed(lv_event_t *e) {
                 cJSON *name = cJSON_GetObjectItem(item, "connection_name");
                 if(cJSON_IsString(name)) {
                     strncpy(conn_name, cJSON_GetStringValue(name), sizeof(conn_name)-1);
-                    DEBUG_LOG("Connection name: %s", conn_name);
+                    LOG_DEBUG("Connection name: %s", conn_name);
                 }
             }
         }
@@ -1142,13 +1057,13 @@ static void ui_event_savedSSIDs_changed(lv_event_t *e) {
     }
     
     if(conn_name[0] == '\0') {
-        DEBUG_LOG("ERROR: Connection name not found");
+        LOG_ERROR("Connection name not found");
         show_temp_label("Connection not found", lv_color_hex(0xFF0000));
         return;
     }
     
-    DEBUG_LOG("=== Auto-Connect to saved WiFi ===");
-    DEBUG_LOG("Disconnecting wlan0");
+    LOG_INFO("Auto-connecting to saved WiFi: %s", conn_name);
+    LOG_DEBUG("Disconnecting wlan0");
     system("sudo nmcli dev disconnect wlan0 > /dev/null 2>&1");
     usleep(1000000);
 
@@ -1157,22 +1072,22 @@ static void ui_event_savedSSIDs_changed(lv_event_t *e) {
              "sudo nmcli connection up '%s' ifname wlan0 > /dev/null 2>&1",
              conn_name);
     
-    DEBUG_LOG("Executing: %s", cmd);
+    LOG_DEBUG("Executing: %s", cmd);
     int ret = system(cmd);
-    DEBUG_LOG("nmcli returned: %d", ret);
+    LOG_DEBUG("nmcli returned: %d", ret);
 
     lv_obj_invalidate(lv_scr_act());
     lv_refr_now(NULL);
     
     if (ret == 0) {
-        DEBUG_LOG("WiFi connected successfully");
+        LOG_INFO("WiFi connected successfully");
         if (ui_Label35 && lv_obj_is_valid(ui_Label35)) {
             lv_label_set_text(ui_Label35, "Verbunden");
         }
         show_temp_label("WiFi connected", lv_color_hex(0x00FF00));
         wifi_status_popup();
     } else {
-        DEBUG_LOG("WiFi connection failed");
+        LOG_ERROR("WiFi connection failed (code %d)", ret);
         if (ui_Label35 && lv_obj_is_valid(ui_Label35)) {
             lv_label_set_text(ui_Label35, "Fehler bei Verbindung");
         }
@@ -1181,16 +1096,15 @@ static void ui_event_savedSSIDs_changed(lv_event_t *e) {
 }
 
 static void ui_event_SwitchWLANOnOff(lv_event_t *e) {
-    DEBUG_LOG("ui_event_SwitchWLANOnOff: event=%d", lv_event_get_code(e));
     if(lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
 
     lv_obj_t *sw = lv_event_get_target(e);
     bool state = lv_obj_has_state(sw, LV_STATE_CHECKED);
-    DEBUG_LOG("WLAN toggle state: %s", state ? "ON" : "OFF");
+    LOG_INFO("WLAN toggle: %s", state ? "ON" : "OFF");
 
     lv_obj_t *spinner = lv_spinner_create(lv_scr_act());
     if (!spinner) {
-        DEBUG_LOG("ERROR: Could not create spinner!");
+        LOG_ERROR("Could not create spinner!");
         return;
     }
     
@@ -1200,20 +1114,20 @@ static void ui_event_SwitchWLANOnOff(lv_event_t *e) {
     lv_refr_now(NULL);
 
     if (state) {
-        DEBUG_LOG("WiFi Toggle ON - Starting services...");
+        LOG_INFO("WiFi Toggle ON - Starting services...");
         show_temp_label("WLAN wird aktiviert...", lv_color_hex(0xFFFF00));
         
-        DEBUG_LOG("Starting wpa_supplicant");
+        LOG_DEBUG("Starting wpa_supplicant");
         system("sudo systemctl start wpa_supplicant.service");
         usleep(500000);
         lv_refr_now(NULL);
         
-        DEBUG_LOG("Starting NetworkManager");
+        LOG_DEBUG("Starting NetworkManager");
         system("sudo systemctl start NetworkManager.service");
         usleep(500000);
         lv_refr_now(NULL);
         
-        DEBUG_LOG("Enabling WiFi radio");
+        LOG_DEBUG("Enabling WiFi radio");
         system("sudo nmcli radio wifi on");
         usleep(1000000);
         
@@ -1224,25 +1138,25 @@ static void ui_event_SwitchWLANOnOff(lv_event_t *e) {
         
         wifi_status_popup();
         
-        DEBUG_LOG("Creating delayed timer for SSID update");
+        LOG_DEBUG("Creating delayed timer for SSID update");
         lv_timer_t *delayed = lv_timer_create(delayed_update_saved_ssids, 3000, NULL);
         lv_timer_set_repeat_count(delayed, 1);
         
     } else {
-        DEBUG_LOG("WiFi Toggle OFF - Stopping services...");
+        LOG_INFO("WiFi Toggle OFF - Stopping services...");
         show_temp_label("WLAN wird deaktiviert...", lv_color_hex(0xFFFF00));
         
-        DEBUG_LOG("Disabling WiFi radio");
+        LOG_DEBUG("Disabling WiFi radio");
         system("sudo nmcli radio wifi off");
         usleep(500000);
         lv_refr_now(NULL);
         
-        DEBUG_LOG("Stopping NetworkManager");
+        LOG_DEBUG("Stopping NetworkManager");
         system("sudo systemctl stop NetworkManager.service");
         usleep(500000);
         lv_refr_now(NULL);
         
-        DEBUG_LOG("Stopping wpa_supplicant");
+        LOG_DEBUG("Stopping wpa_supplicant");
         system("sudo systemctl stop wpa_supplicant.service");
         usleep(500000);
         
@@ -1262,9 +1176,6 @@ static void ui_event_SwitchWLANOnOff(lv_event_t *e) {
     lv_timer_set_period(status_refresh, 2000);
     lv_timer_set_repeat_count(status_refresh, 1);
     lv_timer_set_cb(status_refresh, wlan_status_timer);
-
-
-    DEBUG_LOG("ui_event_SwitchWLANOnOff: END");
 }
 
 /* ===== Battery Statistics Display ===== */
@@ -1272,10 +1183,10 @@ static void ui_event_SwitchWLANOnOff(lv_event_t *e) {
 static int current_battery_id = -1;
 
 static void update_battery_info_panel(int battery_id) {
-    DEBUG_LOG("update_battery_info_panel: battery_id=%d", battery_id);
+    LOG_DEBUG_ONCE("update_battery_info_panel: First call for battery %d", battery_id);
     
     if (battery_id < 0 || battery_id >= MAX_MODULES) {
-        DEBUG_LOG("ERROR: Invalid battery ID: %d", battery_id);
+        LOG_ERROR("Invalid battery ID: %d", battery_id);
         return;
     }
     
@@ -1283,7 +1194,7 @@ static void update_battery_info_panel(int battery_id) {
     
     FILE *f = fopen(BATTERY_STATS_FILE, "r");
     if (!f) {
-        DEBUG_LOG("ERROR: Could not open %s", BATTERY_STATS_FILE);
+        LOG_WARN("Could not open %s", BATTERY_STATS_FILE);
         if (ui_lbTotalChargingTime && lv_obj_is_valid(ui_lbTotalChargingTime))
             lv_label_set_text(ui_lbTotalChargingTime, "N/A");
         if (ui_lbWh && lv_obj_is_valid(ui_lbWh))
@@ -1304,7 +1215,7 @@ static void update_battery_info_panel(int battery_id) {
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
-    DEBUG_LOG("Battery stats file size: %ld bytes", fsize);
+    LOG_DEBUG_ONCE("Battery stats file size: %ld bytes", fsize);
     
     char *buf = malloc(fsize + 1);
     fread(buf, 1, fsize, f);
@@ -1315,13 +1226,13 @@ static void update_battery_info_panel(int battery_id) {
     free(buf);
     
     if (!root) {
-        DEBUG_LOG("ERROR: Could not parse stats JSON");
+        LOG_ERROR("Could not parse battery stats JSON");
         return;
     }
     
     cJSON *modules = cJSON_GetObjectItem(root, "modules");
     if (!cJSON_IsArray(modules)) {
-        DEBUG_LOG("ERROR: modules is not an array");
+        LOG_ERROR("modules is not an array in stats JSON");
         cJSON_Delete(root);
         return;
     }
@@ -1332,13 +1243,13 @@ static void update_battery_info_panel(int battery_id) {
         cJSON *id = cJSON_GetObjectItem(m, "id");
         if (cJSON_IsNumber(id) && id->valueint == battery_id) {
             module = m;
-            DEBUG_LOG("Found module data for battery %d", battery_id);
+            LOG_DEBUG_ONCE("Found module data for battery %d", battery_id);
             break;
         }
     }
     
     if (!module) {
-        DEBUG_LOG("ERROR: Module %d not found in stats", battery_id);
+        LOG_WARN("Module %d not found in stats", battery_id);
         cJSON_Delete(root);
         return;
     }
@@ -1361,7 +1272,6 @@ static void update_battery_info_panel(int battery_id) {
         snprintf(text, sizeof(text), "%02d:%02d:%02d", hours, minutes, secs);
         if (ui_lbTotalChargingTime && lv_obj_is_valid(ui_lbTotalChargingTime)) {
             lv_label_set_text(ui_lbTotalChargingTime, text);
-            DEBUG_LOG("Total charging time: %s", text);
         }
     }
     
@@ -1369,7 +1279,6 @@ static void update_battery_info_panel(int battery_id) {
         snprintf(text, sizeof(text), "%.2f Wh", wh->valuedouble);
         if (ui_lbWh && lv_obj_is_valid(ui_lbWh)) {
             lv_label_set_text(ui_lbWh, text);
-            DEBUG_LOG("Wh: %s", text);
         }
     }
     
@@ -1377,7 +1286,6 @@ static void update_battery_info_panel(int battery_id) {
         snprintf(text, sizeof(text), "%.3f Ah", ah->valuedouble);
         if (ui_lbAh && lv_obj_is_valid(ui_lbAh)) {
             lv_label_set_text(ui_lbAh, text);
-            DEBUG_LOG("Ah: %s", text);
         }
     }
     
@@ -1385,7 +1293,6 @@ static void update_battery_info_panel(int battery_id) {
         snprintf(text, sizeof(text), "%.1f C", min_temp->valuedouble);
         if (ui_lbMinTemp && lv_obj_is_valid(ui_lbMinTemp)) {
             lv_label_set_text(ui_lbMinTemp, text);
-            DEBUG_LOG("Min temp: %s", text);
         }
     }
     
@@ -1393,7 +1300,6 @@ static void update_battery_info_panel(int battery_id) {
         snprintf(text, sizeof(text), "%.1f C", max_temp->valuedouble);
         if (ui_lbMaxTemp && lv_obj_is_valid(ui_lbMaxTemp)) {
             lv_label_set_text(ui_lbMaxTemp, text);
-            DEBUG_LOG("Max temp: %s", text);
         }
     }
     
@@ -1401,7 +1307,6 @@ static void update_battery_info_panel(int battery_id) {
         snprintf(text, sizeof(text), "%.1f %%", soh->valuedouble);
         if (ui_lbSoH && lv_obj_is_valid(ui_lbSoH)) {
             lv_label_set_text(ui_lbSoH, text);
-            DEBUG_LOG("SoH: %s", text);
         }
     }
     
@@ -1409,12 +1314,11 @@ static void update_battery_info_panel(int battery_id) {
         snprintf(text, sizeof(text), "%.1f %%", soc->valuedouble);
         if (ui_lbSoC && lv_obj_is_valid(ui_lbSoC)) {
             lv_label_set_text(ui_lbSoC, text);
-            DEBUG_LOG("SoC: %s", text);
         }
     }
     
     cJSON_Delete(root);
-    DEBUG_LOG("Battery %d info updated successfully", battery_id);
+    LOG_DEBUG_ONCE("Battery %d info updated successfully", battery_id);
 }
 
 static void battery_info_refresh_timer(lv_timer_t *t) {
@@ -1422,13 +1326,11 @@ static void battery_info_refresh_timer(lv_timer_t *t) {
     
     if (current_battery_id >= 0 && ui_Panel2 && lv_obj_is_valid(ui_Panel2) && 
         !lv_obj_has_flag(ui_Panel2, LV_OBJ_FLAG_HIDDEN)) {
-        DEBUG_LOG("battery_info_refresh_timer: updating battery %d", current_battery_id);
         update_battery_info_panel(current_battery_id);
     }
 }
 
 static void battery_info_btn_cb(lv_event_t *e) {
-    DEBUG_LOG("battery_info_btn_cb: event=%d", lv_event_get_code(e));
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     
     lv_obj_t *btn = lv_event_get_target(e);
@@ -1443,7 +1345,7 @@ static void battery_info_btn_cb(lv_event_t *e) {
     else if (btn == ui_btnInfoBatt7) battery_id = 6;
     else if (btn == ui_btnInfoBatt8) battery_id = 7;
     
-    DEBUG_LOG("Battery info button pressed: ID=%d", battery_id);
+    LOG_INFO("Battery info button pressed: ID=%d", battery_id);
     
     if (battery_id >= 0) {
         update_battery_info_panel(battery_id);
@@ -1455,7 +1357,7 @@ static void battery_info_btn_cb(lv_event_t *e) {
 static void update_from_json(void) {
     static bool was_successful = true;
     static time_t last_error_log = 0;
-    static int consecutive_errors = 0;  /* NEU: Zaehle aufeinanderfolgende Fehler */
+    static int consecutive_errors = 0;
     
     LOG_DEBUG_ONCE("=== update_from_json: First call snapshot ===");
     LOG_DEBUG_ONCE("GUI_DATA_FILE path: %s", GUI_DATA_FILE);
@@ -1469,8 +1371,7 @@ static void update_from_json(void) {
         return;
     }
     
-    /* Ueberspringe wenn Datei leer oder zu klein */
-    if (st.st_size < 50) {  /* Minimale JSON-Groesse */
+    if (st.st_size < 50) {
         return;
     }
     
@@ -1504,11 +1405,8 @@ static void update_from_json(void) {
     cJSON *root = cJSON_Parse(buf);
     
     if (!root) {
-        consecutive_errors++;  /* NEU: Zaehle Fehler */
+        consecutive_errors++;
         
-        /* Nur loggen wenn:
-           1. Es der erste Fehler nach Erfolg ist ODER
-           2. Mehr als 10 Sekunden her UND mehr als 20 Fehler */
         time_t now = time(NULL);
         if ((was_successful && consecutive_errors == 1) || 
             ((now - last_error_log) > 10 && consecutive_errors > 20)) {
@@ -1520,17 +1418,16 @@ static void update_from_json(void) {
             }
             LOG_DEBUG("This usually happens during file write operations");
             last_error_log = now;
-            consecutive_errors = 0;  /* Reset nach Log */
+            consecutive_errors = 0;
         }
         
         was_successful = false;
         free(buf);
-        return;  /* Still ueberspringen, kein Spam */
+        return;
     }
     
-    /* Erfolg! */
     if (!was_successful || consecutive_errors > 0) {
-        if (consecutive_errors > 5) {  /* Nur wenn es viele Fehler gab */
+        if (consecutive_errors > 5) {
             LOG_INFO("JSON parsing recovered after %d errors", consecutive_errors);
         }
         was_successful = true;
@@ -1539,8 +1436,6 @@ static void update_from_json(void) {
     
     free(buf);
     LOG_DEBUG_ONCE("JSON parsed successfully");
-    
-    /* ... Rest bleibt gleich ... */
     
     cJSON *mods = cJSON_GetObjectItem(root, "modules");
     if (!mods) {
@@ -1606,7 +1501,6 @@ static void update_from_json(void) {
         float voltage = bus_v->valuedouble;
         LOG_DEBUG_ONCE("Module %d: First voltage reading = %.2f V", idx, voltage);
         
-        /* Kritische Spannungen immer warnen, aber rate-limited */
         static time_t last_voltage_warn[MAX_MODULES] = {0};
         time_t now = time(NULL);
         
@@ -1664,7 +1558,7 @@ static void json_update_timer(lv_timer_t *t) {
 /* ===== Simulator Configuration ===== */
 
 static void print_lvgl_version(void) {
-    LOG_DEBUG("%d.%d.%d-%s\n",
+    LOG_INFO("%d.%d.%d-%s",
             LVGL_VERSION_MAJOR,
             LVGL_VERSION_MINOR,
             LVGL_VERSION_PATCH,
@@ -1672,13 +1566,13 @@ static void print_lvgl_version(void) {
 }
 
 static void print_usage(void) {
-    LOG_DEBUG("\nlvglsim [-V] [-B] [-b backend_name] [-W width] [-H height]\n\n");
-    LOG_DEBUG("-V print LVGL version\n");
-    LOG_DEBUG("-B list supported backends\n");
+    LOG_INFO("lvglsim [-V] [-B] [-b backend_name] [-W width] [-H height]");
+    LOG_INFO("-V print LVGL version");
+    LOG_INFO("-B list supported backends");
 }
 
 static void configure_simulator(int argc, char **argv) {
-    DEBUG_LOG("configure_simulator: START");
+    LOG_DEBUG_ONCE("configure_simulator: Configuring simulator");
     
     int opt = 0;
     selected_backend = NULL;
@@ -1689,10 +1583,9 @@ static void configure_simulator(int argc, char **argv) {
     settings.window_width = atoi(env_w ? env_w : "480");
     settings.window_height = atoi(env_h ? env_h : "320");
     
-    DEBUG_LOG("Window size: %dx%d", settings.window_width, settings.window_height);
+    LOG_DEBUG_ONCE("Window size: %dx%d", settings.window_width, settings.window_height);
 
     while ((opt = getopt(argc, argv, "b:W:H:BVh")) != -1) {
-        DEBUG_LOG("Processing option: -%c", opt);
         switch (opt) {
         case 'h':
             print_usage();
@@ -1708,15 +1601,15 @@ static void configure_simulator(int argc, char **argv) {
                 die("error no such backend: %s\n", optarg);
             }
             selected_backend = strdup(optarg);
-            DEBUG_LOG("Selected backend: %s", selected_backend);
+            LOG_DEBUG("Selected backend: %s", selected_backend);
             break;
         case 'W':
             settings.window_width = atoi(optarg);
-            DEBUG_LOG("Window width: %d", settings.window_width);
+            LOG_DEBUG("Window width: %d", settings.window_width);
             break;
         case 'H':
             settings.window_height = atoi(optarg);
-            DEBUG_LOG("Window height: %d", settings.window_height);
+            LOG_DEBUG("Window height: %d", settings.window_height);
             break;
         case ':':
         case '?':
@@ -1724,17 +1617,14 @@ static void configure_simulator(int argc, char **argv) {
             die("Unknown option or missing argument\n");
         }
     }
-    
-    DEBUG_LOG("configure_simulator: END");
 }
 
-/* LVGL Log-Handler umleiten */
 static void lvgl_log_cb(lv_log_level_t level, const char *buf) {
     (void)level;
     LOG_DEBUG("[LVGL] %s", buf);
 }
 
-/* ===== Main Function (Angepasster Teil) ===== */
+/* ===== Main Function ===== */
 
 int main(int argc, char **argv) {
     /* --- Logging Setup --- */
@@ -1745,9 +1635,9 @@ int main(int argc, char **argv) {
     // log_set_target(LOG_FILE);     /* Nur Logdatei */
     log_set_target(LOG_BOTH);        /* Terminal + Logdatei */
     
-    log_set_level(LOG_LEVEL_DEBUG);  /* Alle Meldungen */
+    log_set_level(LOG_LEVEL_DEBUG);
     
-    LOG_INFO("--- LVGL Application Starting ---");
+    LOG_INFO("=== LVGL Application Starting ===");
     LOG_DEBUG("argc=%d", argc);
     for (int i = 0; i < argc; i++) {
         LOG_DEBUG("argv[%d]=%s", i, argv[i]);
@@ -1841,7 +1731,7 @@ int main(int argc, char **argv) {
     sync_wlan_toggle_with_service_status();
 
     /* --- OTA Startup Check --- */
-    LOG_INFO("--- OTA Startup Check ---");
+    LOG_INFO("=== OTA Startup Check ===");
     update_check_button_visibility();
 
     if (check_wifi_connection()) {
@@ -1860,11 +1750,11 @@ int main(int argc, char **argv) {
     }
 
     /* --- Run Loop --- */
-    LOG_INFO("--- Entering run loop ---");
+    LOG_INFO("=== Entering run loop ===");
     driver_backends_run_loop();
 
     /* --- Cleanup --- */
-    LOG_INFO("--- Application exiting ---");
+    LOG_INFO("=== Application exiting ===");
     log_close_file();
     curl_global_cleanup();
 
