@@ -60,16 +60,15 @@ target_include_directories(lvgl_linux PUBLIC
 target_link_libraries(lvgl PUBLIC ${PKG_CONFIG_LIB} m pthread)
 
 # --- Dein eigenes UI-Projekt ---
+file(GLOB APP_SOURCES
+        src/*.c
+        src/**/*.c
+        src/*.cpp
+        src/**/*.cpp
+)
+
 add_executable(lvgl_app
-        src/main.c
-        src/ui/ui.c
-        src/ui/ui_helpers.c
-        src/ui/ui_theme_manager.c
-        src/ui/ui_themes.c
-        src/ui/ui_events.c
-        src/ui/screens/ui_Screen3.c
-        src/ui/components/ui_comp_hook.c
-        ${LV_LINUX_SRC}
+        ${APP_SOURCES}
         ${LV_LINUX_BACKEND_SRC}
 )
 
