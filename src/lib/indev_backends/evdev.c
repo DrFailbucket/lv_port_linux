@@ -20,6 +20,10 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/input.h>
+#include <string.h>
 
 #include "lvgl/lvgl.h"
 #if LV_USE_EVDEV
@@ -42,6 +46,7 @@ static void indev_deleted_cb(lv_event_t *e);
 static void discovery_cb(lv_indev_t *indev, lv_evdev_type_t type, void *user_data);
 static void set_mouse_cursor_icon(lv_indev_t *indev, lv_display_t *display);
 static lv_indev_t *init_pointer_evdev(lv_display_t *display);
+static const char* find_touch_device_fallback(void);
 
 /**********************
  *  STATIC VARIABLES
@@ -104,6 +109,7 @@ static void indev_deleted_cb(lv_event_t *e)
  * @param type the type of the input device
  * @param user_data the user data
  */
+#if LV_USE_EVEDV_DISCOVER
 static void discovery_cb(lv_indev_t *indev, lv_evdev_type_t type, void *user_data)
 {
     LV_LOG_USER("new '%s' device discovered", type == LV_EVDEV_TYPE_REL ? "REL" :
@@ -118,6 +124,7 @@ static void discovery_cb(lv_indev_t *indev, lv_evdev_type_t type, void *user_dat
         set_mouse_cursor_icon(indev, disp);
     }
 }
+#endif
 
 /*
  * Set cursor icon
@@ -136,41 +143,100 @@ static void set_mouse_cursor_icon(lv_indev_t *indev, lv_display_t *display)
 
     /* delete the mouse cursor icon if the device is removed */
     lv_indev_add_event_cb(indev, indev_deleted_cb, LV_EVENT_DELETE, cursor_obj);
+}
 
+/*
+ * Fallback: Auto-detect touch device
+ *
+ * @description Searches for touch device if symlink not found
+ * @return device path or NULL
+ */
+static const char* find_touch_device_fallback(void)
+{
+    static char device_path[64];
+    char name[256];
+
+    LV_LOG_WARN("Touchscreen symlink not found, auto-detecting...");
+
+    for (int i = 0; i < 32; i++) {
+        snprintf(device_path, sizeof(device_path), "/dev/input/event%d", i);
+
+        int fd = open(device_path, O_RDONLY);
+        if (fd < 0) continue;
+
+        if (ioctl(fd, EVIOCGNAME(sizeof(name)), name) >= 0) {
+            // Search for ADS7846 or generic touch devices
+            if (strstr(name, "ADS7846") ||
+                strstr(name, "Touchscreen") ||
+                strstr(name, "Touch") ||
+                strstr(name, "touch")) {
+                LV_LOG_USER("Auto-detected: %s (%s)", device_path, name);
+                close(fd);
+                return device_path;
+            }
+        }
+        close(fd);
+    }
+
+    LV_LOG_ERROR("No touch device found in /dev/input/event*");
+    return NULL;
 }
 
 /*
  * Initialize a mouse pointer device
  *
  * Enables a pointer (touchscreen/mouse) input device
- * Use 'evtest' to find the correct input device. /dev/input/by-id/ is recommended if possible
- * Use /dev/input/by-id/my-mouse-or-touchscreen or /dev/input/eventX
- *
- * If LV_LINUX_EVDEV_POINTER_DEVICE is not set, automatic evdev disovery will start
+ * Priority:
+ * 1. Environment variable LV_LINUX_EVDEV_POINTER_DEVICE
+ * 2. udev symlink /dev/input/touchscreen
+ * 3. Auto-detection by device name
  *
  * @param display the LVGL display
  *
- * @return input device
+ * @return input device or NULL on failure
  */
 static lv_indev_t *init_pointer_evdev(lv_display_t *display)
 {
     const char *input_device = getenv("LV_LINUX_EVDEV_POINTER_DEVICE");
 
     if (input_device == NULL) {
-        LV_LOG_USER("Using evdev automatic discovery.");
-        lv_evdev_discovery_start(discovery_cb, display);
-        return NULL;
+        // Priority 1: Try stable udev symlink
+        if (access("/dev/input/touchscreen", F_OK) == 0) {
+            input_device = "/dev/input/touchscreen";
+            LV_LOG_USER("Using udev symlink: %s", input_device);
+        }
+        // Priority 2: Try SPI-specific symlink
+        else if (access("/dev/input/touchscreen-spi", F_OK) == 0) {
+            input_device = "/dev/input/touchscreen-spi";
+            LV_LOG_USER("Using SPI symlink: %s", input_device);
+        }
+        // Priority 3: Auto-detect
+        else {
+            input_device = find_touch_device_fallback();
+            if (input_device == NULL) {
+                LV_LOG_ERROR("Touch device not found! Check udev rules.");
+                return NULL;
+            }
+        }
+    } else {
+        LV_LOG_USER("Using env device: %s", input_device);
     }
 
     lv_indev_t *indev = lv_evdev_create(LV_INDEV_TYPE_POINTER, input_device);
 
     if (indev == NULL) {
+        LV_LOG_ERROR("Failed to open: %s", input_device);
         return NULL;
     }
 
     lv_indev_set_display(indev, display);
 
-    set_mouse_cursor_icon(indev, display);
+    // Touch calibration for ADS7846
+    lv_evdev_set_calibration(indev, 0, 4095, 4095, 0);
+
+    LV_LOG_USER("Touch device initialized: %s", input_device);
+
     return indev;
 }
+
 #endif /*#if LV_USE_EVDEV*/
